@@ -1,0 +1,391 @@
+---
+title: "Capstone Milestone Report"
+subtitle: "An initial analysis of text data and natural language processing"
+author: "Ian Dobbs"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.cap = TRUE, fig.align = "center",
+                      fig.path="figures/", options(scipen=999))
+knitr::opts_current$get('label')
+#load libraries
+library(parallel)
+library(tm)
+library(kableExtra)
+library(stringi)
+library(stopwords)
+library(qdapRegex)
+library(RWeka)
+library(ggplot2)
+```
+
+## Executive Summary
+This report is an initial analysis of text data and natural language processing. The purpose is to demonstrate that the text files have been successfully loaded and to show some summary statistics that illustrate the dimensions and word frequencies. It will explain how this contributes to preparations for creating the prediction algorithm and Shiny app that are the ultimate goal of this project. The processing will examine only the English database by executing the following steps:
+
+- data loading
+- summary statistics - word and line counts
+- a representative random sampling of the text data
+- profanity filtering
+- data cleansing
+- exploratory analysis to understand the frequencies of words and pairs
+- consideration of next steps
+ 
+Note that the `echo = FALSE` parameter was added to all code chunks to prevent printing of the R code. All code is available in the Appendix.
+
+## Loading the data
+```{r download, echo=FALSE, cache=TRUE}
+# locate and download the dataset
+fileurl <-  "https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip"
+download.file(fileurl, destfile = "Coursera-SwiftKey.zip", method = "curl")
+unzip("Coursera-SwiftKey.zip")
+```
+
+```{r wordcount, echo=FALSE}
+# Use parallel processing to speed up processing obtain the number of words in each text file.
+
+# Set the directory where your text files are located
+file_directory <- "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/final/en_US/"
+
+# List all text files in the directory
+text_files <- list.files(file_directory, pattern = ".txt", full.names = TRUE)
+
+# Create a function to count words in the text
+count_words <- function(text) {
+        words <- unlist(strsplit(text, "\\s+"))
+        return(length(words))
+}
+
+# Initialize a cluster for parallel processing (I have 8 cores in total and keep 1 for the OS)
+cl <- makeCluster(detectCores()-1)
+
+# Export the necessary variables and functions to the workers
+clusterExport(cl, c("count_words"))
+
+# Load and count words in parallel with parLapply
+results <- parLapply(cl, text_files, function(file) {
+        text <- tolower(readLines(file, warn = FALSE, encoding = "UTF-8"))
+        
+        return(count_words(text))
+})
+
+# Stop the parallel cluster and release resources
+stopCluster(cl)
+
+# Combine the results into a single data frame
+result_names <- basename(text_files)
+result_vectorW <- data.frame(setNames(results, result_names))
+result_vectorW <- t(result_vectorW)
+# Print or save the results
+kable(result_names, format = "markdown", caption = "Loading the English-US text files only", col.names = NULL)
+kable(result_vectorW, format = "markdown", caption = "Summary statistics - Word Count by file", col.names = c("Number of Words"))
+```
+
+```{r linecount, echo=FALSE}
+# Create a function to count lines in a text file
+count_lines <- function(file_path) {
+        lines <- length(readLines(file_path, warn = FALSE, encoding = "UTF-8"))
+        return(lines)
+}
+
+# Initialize a cluster for parallel processing
+cl <- makeCluster(detectCores()-1)
+
+# Export the necessary variables and functions to the workers
+clusterExport(cl, c("count_lines"))
+
+# Count lines in parallel
+results <- parSapply(cl, text_files, function(file) {
+        return(count_lines(file))
+})
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# Combine the results into a named vector
+result_names <- basename(text_files)
+result_vectorL <- setNames(results, result_names)
+
+# Print or save the results
+kable(as.data.frame(result_vectorL), format = "markdown", caption = "Summary statistics - Line Count by file", col.names = c("Number of Lines"))
+```
+## Sampling - a representative random sample of the text data
+It is not necessary to use all of the data to build a predictive model. It is possible that a smaller number of randomly selected rows can produce an accurate approximation versus using all the data. There are also significant memory and system processing constraints that mean it is not possible to use all of the data. For the purposes of this analysis a representative random sample will be taken from each text file and the results combined to create a new sample file for further analysis and processing. The process will take a sample equivalent to 1% of the available data.
+
+```{r sample, echo=FALSE}
+# set seed for reproducibility
+set.seed(1962)
+
+# List of file paths for the three separate text files
+file_paths <- c("C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/final/en_US/en_US.blogs.txt",
+                "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/final/en_US/en_US.news.txt",
+                "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/final/en_US/en_US.twitter.txt")
+
+# Function to calculate the total number of non-empty lines in a file
+get_total_non_empty_lines <- function(file_path) {
+        lines <- readLines(file_path, warn = FALSE)
+        non_empty_lines <- lines[nchar(lines) > 0]
+        return(length(non_empty_lines))
+}
+
+# Calculate the total number of non-empty lines in each file
+total_non_empty_lines <- sapply(file_paths, get_total_non_empty_lines)
+
+# Calculate the total non-empty lines across all files
+total_non_empty_lines_all <- sum(total_non_empty_lines)
+
+# Define the desired sample size as a proportion of the total non-empty lines
+sample_proportion <- 0.01  # 1% of the total non-empty lines
+
+# Calculate the sample size for each file
+sample_size_per_file <- round(sample_proportion * total_non_empty_lines)
+
+# Initialize an empty list to store sampled lines from each file
+sampled_lines_list <- list()
+
+# Loop through each file and sample lines while ignoring empty lines
+for (i in 1:length(file_paths)) {
+        file_path <- file_paths[i]
+        num_non_empty_lines <- total_non_empty_lines[i]
+        sample_size <- sample_size_per_file[i]
+        
+        # Read all lines while ignoring empty lines
+        lines <- readLines(file_path, warn = FALSE)
+        non_empty_lines <- lines[nchar(lines) > 0]
+        
+        # Sample lines proportionally to the non-empty lines
+        sampled_indices <- sample(1:num_non_empty_lines, size = sample_size)
+        
+        # Select the sampled lines from non-empty lines
+        sampled_lines <- non_empty_lines[sampled_indices]
+        
+        sampled_lines_list[[file_path]] <- sampled_lines
+}
+
+# Combine the sampled lines into a single dataset
+combined_lines <- unlist(sampled_lines_list)
+
+# Specify the output file
+output_file <- "output_sample.txt"
+
+# Write the combined lines to the output file
+writeLines(combined_lines, con = output_file)
+cat("Text sample data saved to", output_file, "\n")
+```
+
+The text sample data contains **`r length(combined_lines)`** lines and **`r sum(stri_count_words(combined_lines))`** words.
+
+## Profanity Filtering
+To prevent the prediction of offensive language in the model algorithm and Shiny app it will be removed from the corpus. For this analysis a new list has been created taking as its source Ipsos-MORI research for Ofcom (the UK regulator) published in September 2021 and titled [Public attitudes to offensive language on TV and Radio: Quick Reference Guide](https://www.ofcom.org.uk/__data/assets/pdf_file/0020/225335/offensive-language-quick-reference-guide.pdf)
+The file of offensive words has been compared to the text sample data and any matches have been removed.
+
+```{r profanity, echo=FALSE}
+# Create a list of profanity words
+
+profanity_list <- readLines("C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/ofcomwords.txt",
+                            encoding = "UTF-8", skipNul = TRUE)
+
+# Specify the path to the input/output text file
+
+input_file <- "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/output_sample.txt"
+output_file <- "output_filtered.txt"
+
+# Read the text from the input file
+text <- tolower(readLines(input_file, warn = FALSE))
+
+# Tokenize the text into words
+words <- unlist(strsplit(text, "\\s+"))
+
+# Initialize a count dictionary for profanity words
+profanity_count <- rep(0, length(profanity_list))
+names(profanity_count) <- profanity_list
+
+# Count the occurrences of profanity words
+for (word in words) {
+        if (word %in% profanity_list) {
+                profanity_count[word] <- profanity_count[word] + 1
+        }
+}
+
+# Create a data frame for analysis
+profanity_data <- data.frame(Word = names(profanity_count), Count = unname(profanity_count))
+
+# Sort the data frame in descending order by count
+profanity_data <- profanity_data[order(profanity_data$Count, decreasing = TRUE), ]
+
+# Display the sorted data frame
+# print(profanity_data)
+
+# Decide whether to remove profanity based on the counts greater than 0
+if (sum(profanity_count) > 0) {
+        # Create a function to replace profanity words with empty strings
+        replace_profanity <- function(text) {
+                for (word in profanity_list) {
+                        text <- gsub(paste0("\\b", word, "\\b"), "", text, ignore.case = TRUE)
+                }
+                return(text)
+        }
+        
+        # Apply the profanity removal function to the text
+        filtered_text <- replace_profanity(text)
+        
+        # Write the filtered text to the output file
+        writeLines(filtered_text, con = output_file)
+        
+        cat("Filtered text saved to", output_file, "\n")
+        
+} else {
+        # No profanity detected, proceed with the original text
+        cat("No profanity detected. Continue with the original text:\n", text)
+}
+```
+
+## Data Cleansing
+The next step is tokenization of the filtered text. Tokenization is the process of breaking down the sequence of text in the sample into smaller units, most often words or sub-words, called tokens. For the purposes of this project, tokenization is a crucial step because it enables the analysis of text by converting it into a format that can be processed more easily. Identifying tokens such as words, punctuation and numbers makes cleansing the document far more manageable. For this report the following have been removed from the sample text data:
+
+- numbers
+- punctuation and special characters
+- stop words - words considered to be of little value in text analysis because they are highly frequent in most documents and do not carry significant information. e.g."the", "and", "is", "in", "it", "to", "of"
+- white space
+- contractions - removing the apostrophe and/or space from contractions e.g. "don t", "can t", "doesn t", "didn t" 
+
+```{r clean, echo=FALSE}
+# Clean sample text
+
+# # Specify the path to the input/output text file
+input_file <- "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/output_filtered.txt"
+output_file <- "output_cleaned.rds"
+output_file1 <- "output_cleaned.txt"
+
+# Read the text from the input file
+text <- tolower(readLines(input_file, warn = FALSE))
+
+# Remove/replace/extract non-words (Anything that's not a letter or apostrophe;
+# also removes multiple white spaces) from a string.
+
+text <- rm_non_words(text) 
+
+# Define a function to clean text
+clean_text <- function(text) {
+        # Create a Corpus
+        corpus <- Corpus(VectorSource(text))
+        contractions <- content_transformer(function(x, pattern) gsub(pattern, "", x))
+        corpus <- tm_map(corpus, contractions, "'")
+        dont <- content_transformer(function(x, pattern) gsub(pattern, "dont", x))
+        corpus <- tm_map(corpus, dont, "don t")
+        cant <- content_transformer(function(x, pattern) gsub(pattern, "cant", x))
+        corpus <- tm_map(corpus, cant, "can t")
+        doesnt <- content_transformer(function(x, pattern) gsub(pattern, "doesnt", x))
+        corpus <- tm_map(corpus, doesnt, "doesn t")
+        didnt <- content_transformer(function(x, pattern) gsub(pattern, "didnt", x))
+        corpus <- tm_map(corpus, didnt, "didn t")
+        
+        # Remove numbers
+        corpus <- tm_map(corpus, removeNumbers)
+        # Remove punctuation
+        corpus <- tm_map(corpus, removePunctuation)
+        # Remove common English stop words
+        corpus <- tm_map(corpus, removeWords, stopwords("en"))
+        # Strip whitespace
+        corpus <- tm_map(corpus, stripWhitespace)
+        # Remove empty documents
+        corpus <- corpus[!(sapply(corpus, function(x) length(unlist(strsplit(as.character(x), " "))) == 0))]
+        # Combine the cleaned text into a single document
+        cleaned_text <- unlist(corpus)
+        
+        return(cleaned_text)
+}
+
+# Clean the text
+cleaned_text <- clean_text(text)
+
+# Specify the output file path for the cleaned text
+output_file <- "output_cleaned.rds"
+output_file1 <- "output_cleaned.txt"
+
+# Save the cleaned text data to the RDS file
+saveRDS(cleaned_text, file = output_file)
+writeLines(cleaned_text, con = output_file1)
+
+# Print a message indicating where the RDS file is saved
+cat("Filtered & cleaned text saved to", output_file1, "\n")
+```
+
+The filtered and cleaned text sample data contains **`r length(cleaned_text)`** lines and **`r sum(stri_count_words(cleaned_text))`** words.
+
+This has reduced the number of words in the corpus by 45%.
+
+## Exploratory Data Analysis - understanding frequencies of words and word pairs
+The filtered and cleaned text is called a corpus in text mining and natural language processing (NLP) and refers to a large and structured collection of text documents. The corpus is the fundamental resource used in various text analysis tasks, and the next phase of the project, language modelling.
+
+The first text analysis task to be carried out is to report on n-grams. An n-gram is a contiguous sequence of n items from a given sample of text. In the context of text mining and natural language processing for this analysis, these "items" are words. N-grams are a fundamental concept in text analysis and language modelling and are used to understand the structure and patterns within a sequence of text. The "n" in "n-gram" represents the number of items in each sequence.
+
+### Unigrams - single words
+```{r unigram, echo=FALSE, fig.cap="Figure 1: the frequency of single words in the sampled corpus"}
+# create tokenizer functions
+unigram_tokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 1, max = 1))
+bigram_tokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 2, max = 2))
+trigram_tokenizer <- function(x) NGramTokenizer(x, Weka_control(min = 3, max = 3))
+# the text data is in a file, use readLines() to read it into a character vector.
+input_file <- "C:/Users/44772/Documents/Rstudio_projects/datasciencecoursera/dsscapstone/output_cleaned.txt"
+cleaned_text <- tolower(readLines(input_file, warn = FALSE))
+# Create a corpus from cleaned text
+corpus <- VCorpus(VectorSource(cleaned_text))
+# create term document matrix for the corpus
+unigramtdm <- TermDocumentMatrix(corpus, control = list(tokenize = unigram_tokenizer))
+# eliminate sparse terms for each n-gram and get frequencies of n-grams
+# to remove terms that occur in less than 1% of documents
+uFreq <- sort(rowSums(as.matrix(removeSparseTerms(unigramtdm, 0.99))), decreasing = TRUE)
+uFreq <- data.frame(word = names(uFreq), freq = uFreq)
+# generate plot
+ggplot(uFreq[1:20,], aes(x = reorder(word, -freq), y = freq)) +
+        geom_bar(stat = "identity", fill = "blue") +
+        geom_text(aes(label = freq ), hjust = -0.5, size = 3) +
+        coord_flip() +
+        labs(title = "Top 20 Unigrams", x = "", y = "Frequency") +
+        theme_minimal()
+```
+### Bigram - word pairs
+```{r bigram, echo=FALSE, fig.cap="Figure 2: the frequency of two adjacent words in the sampled corpus"}
+bigramtdm <- TermDocumentMatrix(corpus, control = list(tokenize = bigram_tokenizer))
+# to remove terms that occur in less than 0.1% of documents
+bFreq <- sort(rowSums(as.matrix(removeSparseTerms(bigramtdm, 0.999))), decreasing = TRUE)
+bFreq <- data.frame(word = names(bFreq), freq = bFreq)
+ggplot(bFreq[1:20,], aes(x = reorder(word, -freq), y = freq)) +
+        geom_bar(stat = "identity", fill = "blue") +
+        geom_text(aes(label = freq ), hjust = -0.5, size = 3) +
+        coord_flip() +
+        labs(title = "Top 20 Bigrams", x = "", y = "Frequency") +
+        theme_minimal()
+```
+### Trigram - word triplets
+```{r trigram, echo=FALSE, fig.cap="Figure 3: the frequency of three adjacent words in the sampled corpus"}
+trigramtdm <- TermDocumentMatrix(corpus, control = list(tokenize = trigram_tokenizer))
+# to remove terms that occur in less than 0.01% of documents
+tFreq <- sort(rowSums(as.matrix(removeSparseTerms(trigramtdm, 0.9999))), decreasing = TRUE)
+tFreq <- data.frame(word = names(tFreq), freq = tFreq)
+ggplot(tFreq[1:20,], aes(x = reorder(word, -freq), y = freq)) +
+        geom_bar(stat = "identity", fill = "blue") +
+        geom_text(aes(label = freq ), hjust = -0.5, size = 3) +
+        coord_flip() +
+        labs(title = "Top 20 Trigrams", x = "", y = "Frequency") +
+        theme_minimal()
+```
+## Next steps
+The ultimate goal of the capstone project is a predictive algorithm and shiny app to predict the next word from an input word or phrase. The corpus produced for this report serves as the raw material for building and training the text analysis model and algorithm in the next stage of the project. However, a number of challenges still need to addressed and will require fine-tuning. Some potential challenges in the next phase will be:
+
+- inaccurate data, spelling or grammar
+- limited coverage
+- too small a corpus
+- overfitting
+- missing context
+- language variability
+- model bias
+
+\newpage
+
+# Appendix A: All R code for this report
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
